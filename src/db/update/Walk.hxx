@@ -25,7 +25,10 @@
 #include "config.h"
 
 #include <atomic>
+#include <cstdint>
+#include <string>
 #include <string_view>
+#include <unordered_set>
 
 struct StorageFileInfo;
 struct Directory;
@@ -37,6 +40,8 @@ class Storage;
 class ExcludeList;
 
 class UpdateWalk final {
+	friend void WalkMetricsEmit(const char *kind, const UpdateWalk &walk,
+				    const char *extra) noexcept;
 #ifdef ENABLE_ARCHIVE
 	friend class UpdateArchiveVisitor;
 #endif
@@ -56,6 +61,20 @@ class UpdateWalk final {
 	Storage &storage;
 
 	DatabaseEditor editor;
+
+	/**
+	 * Real absolute paths already entered this walk (done-set).
+	 * Used to skip symlink / reified-alias targets already indexed.
+	 */
+	std::unordered_set<std::string> done_real_paths;
+
+	/* Tunable walk observability (also written to /tmp/mpd-walk-metrics.jsonl). */
+	std::uint64_t metric_dirs_entered = 0;
+	std::uint64_t metric_dirs_skipped_done = 0;
+	std::uint64_t metric_alias_skipped = 0;
+	std::uint64_t metric_symlinks_skipped_done = 0;
+	std::uint64_t metric_songs = 0;
+	std::uint64_t metric_max_dir_entries = 0;
 
 public:
 	UpdateWalk(const UpdateConfig &_config,

@@ -33,17 +33,112 @@
 #include "storage/FileInfo.hxx"
 #include "input/InputStream.hxx"
 #include "input/Error.hxx"
+#include "util/StringAPI.hxx"
 #include "util/StringCompare.hxx"
 #include "util/UriExtract.hxx"
 #include "Log.hxx"
+#include "fs/Path.hxx"
 
 #include <cassert>
 #include <cerrno>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <exception>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+/**
+ * Observability for the efficient walk (todo:d6d78baa).
+ * Tunable: set MPD_WALK_METRICS=0 to disable file output.
+ */
+void
+WalkMetricsEmit(const char *kind, const UpdateWalk &walk,
+		const char *extra) noexcept
+{
+	const char *env = getenv("MPD_WALK_METRICS");
+	if (env != nullptr && env[0] == '0')
+		return;
+
+	FILE *f = fopen("/tmp/mpd-walk-metrics.jsonl", "a");
+	if (f == nullptr)
+		return;
+
+	const auto now = std::chrono::system_clock::now().time_since_epoch();
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+	fprintf(f,
+		"{\"ts_ms\":%lld,\"kind\":\"%s\",\"dirs_entered\":%llu,"
+		"\"dirs_skipped_done\":%llu,\"alias_skipped\":%llu,"
+		"\"sym_skipped_done\":%llu,\"songs\":%llu,"
+		"\"done_set\":%zu,\"max_dir_entries\":%llu%s%s}\n",
+		(long long)ms,
+		kind,
+		(unsigned long long)walk.metric_dirs_entered,
+		(unsigned long long)walk.metric_dirs_skipped_done,
+		(unsigned long long)walk.metric_alias_skipped,
+		(unsigned long long)walk.metric_symlinks_skipped_done,
+		(unsigned long long)walk.metric_songs,
+		walk.done_real_paths.size(),
+		(unsigned long long)walk.metric_max_dir_entries,
+		extra != nullptr && extra[0] != '\0' ? "," : "",
+		extra != nullptr ? extra : "");
+	fclose(f);
+}
+
+gcc_pure
+static int
+NameClass(const char *name) noexcept
+{
+	if (name == nullptr || name[0] == '\0')
+		return 2;
+	const unsigned char ch = (unsigned char)name[0];
+	if (ch >= '0' && ch <= '9')
+		return 0;
+	if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))
+		return 1;
+	return 2;
+}
+
+/**
+ * Alias namespace directories: on CIFS nounix these are reified as distinct
+ * DIR trees (not symlinks), so realpath/inode done-set cannot dedupe them.
+ * Skip descending after the real album pass (they sort into class "other").
+ */
+gcc_pure
+static bool
+IsAliasDirName(const char *name) noexcept
+{
+	return StringIsEqual(name, "_tags") || StringIsEqual(name, "_meta");
+}
+
+#ifndef _WIN32
+/**
+ * Resolve storage-relative UTF-8 directory URI to a real absolute path
+ * for the done-set.  Empty string on failure.
+ */
+static std::string
+StorageRealPath(Storage &storage, const char *uri_utf8) noexcept
+{
+	const auto path_fs = storage.MapFS(uri_utf8);
+	if (path_fs.IsNull())
+		return {};
+
+	char buf[PATH_MAX];
+	if (realpath(path_fs.c_str(), buf) == nullptr)
+		return path_fs.c_str();
+	return buf;
+}
+#endif
 
 UpdateWalk::UpdateWalk(const UpdateConfig &_config,
 		       EventLoop &_loop, DatabaseListener &_listener,
@@ -343,6 +438,26 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 
 	directory_set_stat(directory, info);
 
+#ifndef _WIN32
+	/* done-set: record real abspath on directory entry */
+	{
+		const std::string real = StorageRealPath(storage,
+							 directory.GetPath());
+		if (!real.empty()) {
+			const auto inserted = done_real_paths.insert(real);
+			if (!inserted.second) {
+				++metric_dirs_skipped_done;
+				WalkMetricsEmit("skip_dir_done", *this,
+						"\"reason\":\"done_set\"");
+				return true;
+			}
+		}
+	}
+#endif
+	++metric_dirs_entered;
+	if ((metric_dirs_entered % 50) == 0)
+		WalkMetricsEmit("milestone", *this, "");
+
 	std::unique_ptr<StorageDirectoryReader> reader;
 
 	try {
@@ -360,6 +475,15 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 
 	PurgeDeletedFromDirectory(directory);
 
+	/* Collect children, then visit real entries before symlinks.
+	   Sort within class: digit, letter, other (deterministic). */
+	struct ChildEntry {
+		std::string name;
+		StorageFileInfo info;
+		bool is_symlink;
+	};
+	std::vector<ChildEntry> children;
+
 	const char *name_utf8;
 	while (!cancel && (name_utf8 = reader->Read()) != nullptr) {
 		if (skip_path(name_utf8))
@@ -369,6 +493,16 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 			const auto name_fs = AllocatedPath::FromUTF8(name_utf8);
 			if (name_fs.IsNull() || child_exclude_list.Check(name_fs))
 				continue;
+		}
+
+		if (IsAliasDirName(name_utf8)) {
+			/* CIFS nounix reifies alias trees as DIRs with distinct
+			   inodes; skipping by name preserves the efficient-walk
+			   intent after real album directories are indexed. */
+			++metric_alias_skipped;
+			modified |= editor.DeleteNameIn(directory, name_utf8);
+			WalkMetricsEmit("alias_skip", *this, "");
+			continue;
 		}
 
 		if (SkipSymlink(&directory, name_utf8)) {
@@ -382,7 +516,53 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 			continue;
 		}
 
-		UpdateDirectoryChild(directory, child_exclude_list, name_utf8, info2);
+		bool is_symlink = false;
+#ifndef _WIN32
+		{
+			const auto path_fs = storage.MapChildFS(directory.GetPath(),
+							       name_utf8);
+			if (!path_fs.IsNull()) {
+				const auto target = ReadLink(path_fs);
+				is_symlink = !target.IsNull();
+			}
+		}
+		if (is_symlink && info2.IsDirectory()) {
+			const auto child_uri =
+				PathTraitsUTF8::Build(directory.GetPath(),
+						      name_utf8);
+			const std::string real = StorageRealPath(storage,
+								 child_uri.c_str());
+			if (!real.empty() &&
+			    done_real_paths.find(real) != done_real_paths.end()) {
+				++metric_symlinks_skipped_done;
+				modified |= editor.DeleteNameIn(directory,
+								name_utf8);
+				continue;
+			}
+		}
+#endif
+		children.push_back(ChildEntry{name_utf8, info2, is_symlink});
+	}
+
+	if (children.size() > metric_max_dir_entries)
+		metric_max_dir_entries = children.size();
+
+	std::stable_sort(children.begin(), children.end(),
+			 [](const ChildEntry &a, const ChildEntry &b) {
+				 if (a.is_symlink != b.is_symlink)
+					 return !a.is_symlink && b.is_symlink;
+				 const int ca = NameClass(a.name.c_str());
+				 const int cb = NameClass(b.name.c_str());
+				 if (ca != cb)
+					 return ca < cb;
+				 return a.name < b.name;
+			 });
+
+	for (const auto &child : children) {
+		if (cancel)
+			break;
+		UpdateDirectoryChild(directory, child_exclude_list,
+				     child.name.c_str(), child.info);
 	}
 
 	directory.mtime = info.mtime;
@@ -510,6 +690,14 @@ UpdateWalk::Walk(Directory &root, const char *path, bool discard) noexcept
 {
 	walk_discard = discard;
 	modified = false;
+	done_real_paths.clear();
+	metric_dirs_entered = 0;
+	metric_dirs_skipped_done = 0;
+	metric_alias_skipped = 0;
+	metric_symlinks_skipped_done = 0;
+	metric_songs = 0;
+	metric_max_dir_entries = 0;
+	WalkMetricsEmit("start", *this, "");
 
 	if (path != nullptr && !isRootDirectory(path)) {
 		UpdateUri(root, path);
@@ -534,5 +722,6 @@ UpdateWalk::Walk(Directory &root, const char *path, bool discard) noexcept
 		PurgeDanglingFromPlaylists(root);
 	}
 
+	WalkMetricsEmit("final", *this, "");
 	return modified;
 }
