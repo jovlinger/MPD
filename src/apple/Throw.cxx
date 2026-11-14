@@ -31,6 +31,7 @@
 #include "ErrorRef.hxx"
 #include "StringRef.hxx"
 
+#include <cstring>
 #include <stdexcept>
 
 namespace Apple {

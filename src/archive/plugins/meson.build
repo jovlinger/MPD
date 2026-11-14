@@ -22,6 +22,11 @@ if libzzip_dep.found()
   found_archive_plugin = true
 endif
 
+# macOS ar rejects a static library with zero members; keep a stub object.
+if archive_plugins_sources.length() == 0
+  archive_plugins_sources += 'Empty.cxx'
+endif
+
 archive_plugins = static_library(
   'archive_plugins',
   archive_plugins_sources,
