@@ -126,6 +126,30 @@ Directory::LookupTargetSong(std::string_view _target) noexcept
 	return lr.directory->FindSong(lr.rest);
 }
 
+/**
+ * Browse mirrors (_tags/_meta and everything under them) hold directory
+ * stubs without songs when the don't-walk done-set skips already-indexed
+ * albums.  Stock PruneEmpty would delete that whole tree on Save and
+ * lsinfo would lose the tag index (todo:d6d78baa).
+ */
+gcc_pure
+static bool
+IsIndexBrowseName(const char *name) noexcept
+{
+	return StringIsEqual(name, "_tags") || StringIsEqual(name, "_meta");
+}
+
+gcc_pure
+static bool
+InIndexBrowseTree(const Directory &directory) noexcept
+{
+	for (const Directory *d = &directory; d != nullptr; d = d->parent) {
+		if (!d->IsRoot() && IsIndexBrowseName(d->GetName()))
+			return true;
+	}
+	return false;
+}
+
 void
 Directory::PruneEmpty() noexcept
 {
@@ -135,7 +159,8 @@ Directory::PruneEmpty() noexcept
 	     child != end;) {
 		child->PruneEmpty();
 
-		if (child->IsEmpty() && !child->IsMount())
+		if (child->IsEmpty() && !child->IsMount() &&
+		    !InIndexBrowseTree(*child))
 			child = children.erase_and_dispose(child,
 							   DeleteDisposer());
 		else

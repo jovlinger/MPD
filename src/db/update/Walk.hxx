@@ -29,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 struct StorageFileInfo;
 struct Directory;
@@ -39,9 +40,36 @@ class ArchiveFile;
 class Storage;
 class ExcludeList;
 
+/**
+ * Stable directory identity for the don't-walk set.  Prefer this over
+ * realpath strings: CIFS/smbfs reifies symlinks as directories with distinct
+ * UTF-8 paths but the same device+inode (see todo:d6d78baa Notes).
+ */
+struct WalkDoneId {
+	uint64_t device;
+	uint64_t inode;
+
+	constexpr bool operator==(const WalkDoneId &o) const noexcept {
+		return device == o.device && inode == o.inode;
+	}
+};
+
+struct WalkDoneIdHash {
+	std::size_t operator()(const WalkDoneId &id) const noexcept {
+		return std::hash<uint64_t>{}(id.device) ^
+			(std::hash<uint64_t>{}(id.inode) << 1);
+	}
+};
+
 class UpdateWalk final {
 	friend void WalkMetricsEmit(const char *kind, const UpdateWalk &walk,
 				    const char *extra) noexcept;
+	friend bool DoneSetContains(const UpdateWalk &walk,
+				    const StorageFileInfo &info,
+				    const char *uri_utf8) noexcept;
+	friend bool DoneSetInsert(UpdateWalk &walk,
+				  const StorageFileInfo &info,
+				  const char *uri_utf8) noexcept;
 #ifdef ENABLE_ARCHIVE
 	friend class UpdateArchiveVisitor;
 #endif
@@ -63,15 +91,18 @@ class UpdateWalk final {
 	DatabaseEditor editor;
 
 	/**
-	 * Real absolute paths already entered this walk (done-set).
-	 * Used to skip symlink / reified-alias targets already indexed.
+	 * Directories already entered this walk (don't-walk set).
+	 * Primary key is device+inode when the storage reports them;
+	 * realpath UTF-8 is a fallback when inode is unknown.
 	 */
+	std::unordered_set<WalkDoneId, WalkDoneIdHash> done_ids;
 	std::unordered_set<std::string> done_real_paths;
 
 	/* Tunable walk observability (also written to /tmp/mpd-walk-metrics.jsonl). */
 	std::uint64_t metric_dirs_entered = 0;
 	std::uint64_t metric_dirs_skipped_done = 0;
 	std::uint64_t metric_alias_skipped = 0;
+	std::uint64_t metric_residual_index_skipped = 0;
 	std::uint64_t metric_symlinks_skipped_done = 0;
 	std::uint64_t metric_songs = 0;
 	std::uint64_t metric_max_dir_entries = 0;

@@ -79,20 +79,70 @@ WalkMetricsEmit(const char *kind, const UpdateWalk &walk,
 	fprintf(f,
 		"{\"ts_ms\":%lld,\"kind\":\"%s\",\"dirs_entered\":%llu,"
 		"\"dirs_skipped_done\":%llu,\"alias_skipped\":%llu,"
+		"\"residual_index_skipped\":%llu,"
 		"\"sym_skipped_done\":%llu,\"songs\":%llu,"
-		"\"done_set\":%zu,\"max_dir_entries\":%llu%s%s}\n",
+		"\"done_ids\":%zu,\"done_paths\":%zu,"
+		"\"max_dir_entries\":%llu%s%s}\n",
 		(long long)ms,
 		kind,
 		(unsigned long long)walk.metric_dirs_entered,
 		(unsigned long long)walk.metric_dirs_skipped_done,
 		(unsigned long long)walk.metric_alias_skipped,
+		(unsigned long long)walk.metric_residual_index_skipped,
 		(unsigned long long)walk.metric_symlinks_skipped_done,
 		(unsigned long long)walk.metric_songs,
+		walk.done_ids.size(),
 		walk.done_real_paths.size(),
 		(unsigned long long)walk.metric_max_dir_entries,
 		extra != nullptr && extra[0] != '\0' ? "," : "",
 		extra != nullptr ? extra : "");
 	fclose(f);
+}
+
+/**
+ * Browse mirrors live only at files/_tags and files/_meta (or music-root
+ * _tags/_meta).  Residual album-local _tags (and any other off-mirror copy)
+ * link back into the global tree; on CIFS those links are reified dirs and
+ * must not be descended or the walk explodes before real albums finish.
+ */
+gcc_pure
+static bool
+IsIndexTreeName(const char *name) noexcept
+{
+	return StringIsEqual(name, "_tags") || StringIsEqual(name, "_meta");
+}
+
+/**
+ * A child literally named _tags/_meta is a browse-root only as a direct
+ * child of music root or of files/.  Anywhere else (album-local mirrors,
+ * or albums reached via files/_tags/.../album) it is residual adjacency
+ * into the global tag tree -- emit directory: but do not descend.
+ */
+gcc_pure
+static bool
+ParentAllowsIndexTreeDescend(const char *parent_path) noexcept
+{
+	if (parent_path == nullptr || parent_path[0] == '\0')
+		return true;
+	return StringIsEqual(parent_path, "files");
+}
+
+/**
+ * files/_meta/<Album> may still carry residual artist/genre/year links into
+ * files/_tags (shadup history).  Only the album -> real-album child is the
+ * one-way contract; descending the others on CIFS re-enters the tag tree
+ * under a _meta URI and can ENAMETOOLONG / drop files/_tags.
+ */
+gcc_pure
+static bool
+IsMetaAlbumDir(const char *parent_path) noexcept
+{
+	constexpr char prefix[] = "files/_meta/";
+	if (parent_path == nullptr ||
+	    !StringStartsWith(parent_path, prefix))
+		return false;
+	const char *rest = parent_path + sizeof(prefix) - 1;
+	return rest[0] != '\0' && std::strchr(rest, '/') == nullptr;
 }
 
 gcc_pure
@@ -128,6 +178,62 @@ StorageRealPath(Storage &storage, const char *uri_utf8) noexcept
 }
 #endif
 
+gcc_pure
+bool
+DoneSetContains(const UpdateWalk &walk, const StorageFileInfo &info,
+		const char *uri_utf8) noexcept
+{
+	if (info.inode != 0 || info.device != 0) {
+		const WalkDoneId id{info.device, info.inode};
+		if (walk.done_ids.find(id) != walk.done_ids.end())
+			return true;
+	}
+#ifndef _WIN32
+	if (uri_utf8 != nullptr) {
+		const std::string real = StorageRealPath(walk.storage, uri_utf8);
+		if (!real.empty() &&
+		    walk.done_real_paths.find(real) != walk.done_real_paths.end())
+			return true;
+	}
+#else
+	(void)uri_utf8;
+#endif
+	return false;
+}
+
+bool
+DoneSetInsert(UpdateWalk &walk, const StorageFileInfo &info,
+	      const char *uri_utf8) noexcept
+{
+	if (info.inode != 0 || info.device != 0) {
+		const WalkDoneId id{info.device, info.inode};
+		if (!walk.done_ids.insert(id).second)
+			return false;
+#ifndef _WIN32
+		if (uri_utf8 != nullptr) {
+			const std::string real =
+				StorageRealPath(walk.storage, uri_utf8);
+			if (!real.empty())
+				walk.done_real_paths.insert(real);
+		}
+#else
+		(void)uri_utf8;
+#endif
+		return true;
+	}
+#ifndef _WIN32
+	if (uri_utf8 != nullptr) {
+		const std::string real = StorageRealPath(walk.storage, uri_utf8);
+		if (!real.empty())
+			return walk.done_real_paths.insert(real).second;
+	}
+#else
+	(void)uri_utf8;
+#endif
+	/* No identity available: do not block the walk. */
+	return true;
+}
+
 UpdateWalk::UpdateWalk(const UpdateConfig &_config,
 		       EventLoop &_loop, DatabaseListener &_listener,
 		       Storage &_storage) noexcept
@@ -153,6 +259,9 @@ UpdateWalk::RemoveExcludedFromDirectory(Directory &directory,
 	directory.ForEachChildSafe([&](Directory &child){
 		const auto name_fs =
 			AllocatedPath::FromUTF8(child.GetName());
+
+		if (IsIndexTreeName(child.GetName()))
+			return;
 
 		if (name_fs.IsNull() || exclude_list.Check(name_fs)) {
 			editor.DeleteDirectory(&child);
@@ -302,8 +411,47 @@ try {
 
 		assert(&directory == subdir->parent);
 
-		if (!UpdateDirectory(*subdir, exclude_list, info))
-			editor.LockDeleteDirectory(subdir);
+		if (IsIndexTreeName(name))
+			FmtWarning(update_domain,
+				   "dontwalk-child parent={} name={} allow={}",
+				   directory.GetPath(), name,
+				   ParentAllowsIndexTreeDescend(directory.GetPath()) ? 1 : 0);
+
+		/* Residual album-local _tags/_meta: keep directory: for
+		   lsinfo but do not descend (CIFS reifies those back-edges). */
+		if (IsIndexTreeName(name) &&
+		    !ParentAllowsIndexTreeDescend(directory.GetPath())) {
+			directory_set_stat(*subdir, info);
+			DoneSetInsert(*this, info, subdir->GetPath());
+			++metric_residual_index_skipped;
+			WalkMetricsEmit("residual_index_skip", *this,
+					"\"reason\":\"album_local_index\"");
+			return;
+		}
+
+		/* files/_meta/<Album>/{artist,genre,year}: emit only. */
+		if (IsMetaAlbumDir(directory.GetPath()) &&
+		    !StringIsEqual(name, "album")) {
+			directory_set_stat(*subdir, info);
+			DoneSetInsert(*this, info, subdir->GetPath());
+			++metric_residual_index_skipped;
+			WalkMetricsEmit("residual_index_skip", *this,
+					"\"reason\":\"meta_tag_backedge\"");
+			return;
+		}
+
+		const bool ok = UpdateDirectory(*subdir, exclude_list, info);
+		if (IsIndexTreeName(name))
+			FmtWarning(update_domain,
+				   "dontwalk-child UpdateDirectory({})={}",
+				   name, ok ? 1 : 0);
+		if (!ok) {
+			/* Keep browse-root stubs even if OpenDirectory
+			   failed once on a flaky CIFS handle. */
+			if (!(IsIndexTreeName(name) &&
+			      ParentAllowsIndexTreeDescend(directory.GetPath())))
+				editor.LockDeleteDirectory(subdir);
+		}
 	} else {
 		FmtDebug(update_domain,
 			 "{} is not a directory, archive or music", name);
@@ -426,22 +574,13 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 
 	directory_set_stat(directory, info);
 
-#ifndef _WIN32
-	/* done-set: record real abspath on directory entry */
-	{
-		const std::string real = StorageRealPath(storage,
-							 directory.GetPath());
-		if (!real.empty()) {
-			const auto inserted = done_real_paths.insert(real);
-			if (!inserted.second) {
-				++metric_dirs_skipped_done;
-				WalkMetricsEmit("skip_dir_done", *this,
-						"\"reason\":\"done_set\"");
-				return true;
-			}
-		}
+	/* done-set: device+inode (CIFS-safe) with realpath fallback */
+	if (!DoneSetInsert(*this, info, directory.GetPath())) {
+		++metric_dirs_skipped_done;
+		WalkMetricsEmit("skip_dir_done", *this,
+				"\"reason\":\"done_set\"");
+		return true;
 	}
-#endif
 	++metric_dirs_entered;
 	if ((metric_dirs_entered % 50) == 0)
 		WalkMetricsEmit("milestone", *this, "");
@@ -479,7 +618,12 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 
 		{
 			const auto name_fs = AllocatedPath::FromUTF8(name_utf8);
-			if (name_fs.IsNull() || child_exclude_list.Check(name_fs))
+			/* dont-walk: never .mpdignore-away the browse mirrors
+			   (_tags/_meta). Share files/.mpdignore still lists
+			   them as a CIFS safety belt; this fork indexes them. */
+			if (name_fs.IsNull() ||
+			    (child_exclude_list.Check(name_fs) &&
+			     !IsIndexTreeName(name_utf8)))
 				continue;
 		}
 
@@ -504,19 +648,18 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 				is_symlink = !target.IsNull();
 			}
 		}
-		/* Symlink whose real path is already in the don't-walk set:
-		   still queue as a child so UpdateDirectoryChild emits a
-		   directory: row; UpdateDirectory returns early on the done-set
-		   and does not re-index songs. Do NOT DeleteNameIn here. */
-		if (is_symlink && info2.IsDirectory()) {
+		/* Symlink / reified alias already in the don't-walk set:
+		   still queue so UpdateDirectoryChild emits a directory: row;
+		   UpdateDirectory returns early and does not re-index songs. */
+		if (info2.IsDirectory()) {
 			const auto child_uri =
 				PathTraitsUTF8::Build(directory.GetPath(),
 						      name_utf8);
-			const std::string real = StorageRealPath(storage,
-								 child_uri.c_str());
-			if (!real.empty() &&
-			    done_real_paths.find(real) != done_real_paths.end()) {
-				++metric_symlinks_skipped_done;
+			if (DoneSetContains(*this, info2, child_uri.c_str())) {
+				if (is_symlink)
+					++metric_symlinks_skipped_done;
+				else
+					++metric_alias_skipped;
 			}
 		}
 #endif
@@ -542,6 +685,54 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 			break;
 		UpdateDirectoryChild(directory, child_exclude_list,
 				     child.name.c_str(), child.info);
+	}
+
+	/* CIFS/smbfs: after a long album walk, browse mirrors may be missing.
+	   Force a second look only at files/_tags and files/_meta. */
+	{
+		const char *path = directory.GetPath();
+		const bool is_files =
+			path != nullptr && StringIsEqual(path, "files");
+		if (is_files)
+			FmtWarning(update_domain,
+				   "dontwalk-enddir path={} children={} cancel={}",
+				   path,
+				   children.size(),
+				   cancel ? 1 : 0);
+		if (is_files) {
+			for (const char *name : {"_meta", "_tags"}) {
+				bool present = false;
+				{
+					const ScopeDatabaseLock protect;
+					present = directory.FindChild(name) != nullptr;
+				}
+				FmtWarning(update_domain,
+					   "dontwalk-ensure {} present={}",
+					   name, present ? 1 : 0);
+				if (present)
+					continue;
+				const auto uri =
+					PathTraitsUTF8::Build(path, name);
+				StorageFileInfo info_retry;
+				bool ok = false;
+				for (int attempt = 0; attempt < 3; ++attempt) {
+					if (GetInfo(storage, uri.c_str(),
+						    info_retry) &&
+					    info_retry.IsDirectory()) {
+						ok = true;
+						break;
+					}
+				}
+				FmtWarning(update_domain,
+					   "dontwalk-ensure {} getinfo={}",
+					   uri.c_str(), ok ? 1 : 0);
+				if (!ok)
+					continue;
+				UpdateDirectoryChild(directory,
+						     child_exclude_list,
+						     name, info_retry);
+			}
+		}
 	}
 
 	directory.mtime = info.mtime;
@@ -669,10 +860,12 @@ UpdateWalk::Walk(Directory &root, const char *path, bool discard) noexcept
 {
 	walk_discard = discard;
 	modified = false;
+	done_ids.clear();
 	done_real_paths.clear();
 	metric_dirs_entered = 0;
 	metric_dirs_skipped_done = 0;
 	metric_alias_skipped = 0;
+	metric_residual_index_skipped = 0;
 	metric_symlinks_skipped_done = 0;
 	metric_songs = 0;
 	metric_max_dir_entries = 0;
