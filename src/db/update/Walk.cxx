@@ -109,18 +109,6 @@ NameClass(const char *name) noexcept
 	return 2;
 }
 
-/**
- * Alias namespace directories: on CIFS nounix these are reified as distinct
- * DIR trees (not symlinks), so realpath/inode done-set cannot dedupe them.
- * Skip descending after the real album pass (they sort into class "other").
- */
-gcc_pure
-static bool
-IsAliasDirName(const char *name) noexcept
-{
-	return StringIsEqual(name, "_tags") || StringIsEqual(name, "_meta");
-}
-
 #ifndef _WIN32
 /**
  * Resolve storage-relative UTF-8 directory URI to a real absolute path
@@ -495,16 +483,6 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 				continue;
 		}
 
-		if (IsAliasDirName(name_utf8)) {
-			/* CIFS nounix reifies alias trees as DIRs with distinct
-			   inodes; skipping by name preserves the efficient-walk
-			   intent after real album directories are indexed. */
-			++metric_alias_skipped;
-			modified |= editor.DeleteNameIn(directory, name_utf8);
-			WalkMetricsEmit("alias_skip", *this, "");
-			continue;
-		}
-
 		if (SkipSymlink(&directory, name_utf8)) {
 			modified |= editor.DeleteNameIn(directory, name_utf8);
 			continue;
@@ -526,6 +504,10 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 				is_symlink = !target.IsNull();
 			}
 		}
+		/* Symlink whose real path is already in the don't-walk set:
+		   still queue as a child so UpdateDirectoryChild emits a
+		   directory: row; UpdateDirectory returns early on the done-set
+		   and does not re-index songs. Do NOT DeleteNameIn here. */
 		if (is_symlink && info2.IsDirectory()) {
 			const auto child_uri =
 				PathTraitsUTF8::Build(directory.GetPath(),
@@ -535,9 +517,6 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 			if (!real.empty() &&
 			    done_real_paths.find(real) != done_real_paths.end()) {
 				++metric_symlinks_skipped_done;
-				modified |= editor.DeleteNameIn(directory,
-								name_utf8);
-				continue;
 			}
 		}
 #endif
