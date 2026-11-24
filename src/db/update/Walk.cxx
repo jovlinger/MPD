@@ -100,16 +100,31 @@ WalkMetricsEmit(const char *kind, const UpdateWalk &walk,
 }
 
 /**
- * Browse mirrors live only at files/_tags and files/_meta (or music-root
- * _tags/_meta).  Residual album-local _tags (and any other off-mirror copy)
- * link back into the global tree; on CIFS those links are reified dirs and
- * must not be descended or the walk explodes before real albums finish.
+ * Browse mirrors live only at .../files/_tags and .../files/_meta (or
+ * music-root _tags/_meta).  Residual album-local _tags (and any other
+ * off-mirror copy) link back into the global tree; on CIFS those links are
+ * reified dirs and must not be descended or the walk explodes before real
+ * albums finish.
  */
 gcc_pure
 static bool
 IsIndexTreeName(const char *name) noexcept
 {
 	return StringIsEqual(name, "_tags") || StringIsEqual(name, "_meta");
+}
+
+/**
+ * True for the library "files" directory URI, including nested mounts
+ * such as SHD ``NAS/gmk/files`` (not only a top-level ``files``).
+ */
+gcc_pure
+static bool
+IsFilesDirPath(const char *path) noexcept
+{
+	if (path == nullptr || path[0] == '\0')
+		return false;
+	return StringIsEqual(path, "files") ||
+		StringEndsWith(path, "/files");
 }
 
 /**
@@ -124,25 +139,35 @@ ParentAllowsIndexTreeDescend(const char *parent_path) noexcept
 {
 	if (parent_path == nullptr || parent_path[0] == '\0')
 		return true;
-	return StringIsEqual(parent_path, "files");
+	return IsFilesDirPath(parent_path);
 }
 
 /**
- * files/_meta/<Album> may still carry residual artist/genre/year links into
- * files/_tags (shadup history).  Only the album -> real-album child is the
+ * .../_meta/<Album> may still carry residual artist/genre/year links into
+ * _tags (shadup history).  Only the album -> real-album child is the
  * one-way contract; descending the others on CIFS re-enters the tag tree
  * under a _meta URI and can ENAMETOOLONG / drop files/_tags.
+ *
+ * Matches both ``files/_meta/Album`` and ``NAS/gmk/files/_meta/Album``.
  */
 gcc_pure
 static bool
 IsMetaAlbumDir(const char *parent_path) noexcept
 {
-	constexpr char prefix[] = "files/_meta/";
-	if (parent_path == nullptr ||
-	    !StringStartsWith(parent_path, prefix))
+	if (parent_path == nullptr || parent_path[0] == '\0')
 		return false;
-	const char *rest = parent_path + sizeof(prefix) - 1;
-	return rest[0] != '\0' && std::strchr(rest, '/') == nullptr;
+
+	const char *rest = nullptr;
+	if (StringStartsWith(parent_path, "files/_meta/"))
+		rest = parent_path + sizeof("files/_meta/") - 1;
+	else {
+		const char *hit = std::strstr(parent_path, "/_meta/");
+		if (hit != nullptr)
+			rest = hit + sizeof("/_meta/") - 1;
+	}
+	if (rest == nullptr || rest[0] == '\0')
+		return false;
+	return std::strchr(rest, '/') == nullptr;
 }
 
 gcc_pure
@@ -618,12 +643,9 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 
 		{
 			const auto name_fs = AllocatedPath::FromUTF8(name_utf8);
-			/* dont-walk: never .mpdignore-away the browse mirrors
-			   (_tags/_meta). Share files/.mpdignore still lists
-			   them as a CIFS safety belt; this fork indexes them. */
-			if (name_fs.IsNull() ||
-			    (child_exclude_list.Check(name_fs) &&
-			     !IsIndexTreeName(name_utf8)))
+			/* Honor .mpdignore for everyone, including _tags/_meta.
+			   Ops can ignore _meta while still walking _tags. */
+			if (name_fs.IsNull() || child_exclude_list.Check(name_fs))
 				continue;
 		}
 
@@ -688,11 +710,10 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 	}
 
 	/* CIFS/smbfs: after a long album walk, browse mirrors may be missing.
-	   Force a second look only at files/_tags and files/_meta. */
+	   Force a second look only at .../files/_tags and .../files/_meta. */
 	{
 		const char *path = directory.GetPath();
-		const bool is_files =
-			path != nullptr && StringIsEqual(path, "files");
+		const bool is_files = IsFilesDirPath(path);
 		if (is_files)
 			FmtWarning(update_domain,
 				   "dontwalk-enddir path={} children={} cancel={}",
@@ -701,6 +722,12 @@ UpdateWalk::UpdateDirectory(Directory &directory,
 				   cancel ? 1 : 0);
 		if (is_files) {
 			for (const char *name : {"_meta", "_tags"}) {
+				const auto name_fs =
+					AllocatedPath::FromUTF8(name);
+				/* Do not revive .mpdignore'd mirrors. */
+				if (!name_fs.IsNull() &&
+				    child_exclude_list.Check(name_fs))
+					continue;
 				bool present = false;
 				{
 					const ScopeDatabaseLock protect;
